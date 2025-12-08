@@ -1,331 +1,496 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from datetime import datetime
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Reshape
+import matplotlib.pyplot as plt
 
-# Đọc dữ liệu
-df = pd.read_csv('sbc_counter_result.csv')
+# ==== CONFIG ====
+csv_path = "sbc_counter_result.csv"
 
-# Chuyển đổi trigger_time sang datetime
-df['datetime'] = pd.to_datetime(df['trigger_time'], unit='s')
-df = df.sort_values(['node_id', 'counter_id', 'trigger_time'])
+n_past = 24                   # số bước thời gian dùng làm input
+target_counters = [6, 9]   # các counter_id cần DỰ ĐOÁN (n_counter)
 
-print("Thông tin dữ liệu:")
-print(f"Số lượng bản ghi: {len(df)}")
-print(f"Số node: {df['node_id'].nunique()}")
-print(f"Số counter: {df['counter_id'].nunique()}")
-print(f"Khoảng thời gian: {df['datetime'].min()} đến {df['datetime'].max()}")
-print("\n" + "="*70 + "\n")
+# ==== LOAD & PIVOT ====
+df = pd.read_csv(csv_path)
 
-# Tạo features từ thời gian
-def create_time_features(data):
-    """Tạo các đặc trưng từ timestamp"""
-    data['hour'] = data['datetime'].dt.hour / 24.0  # Normalize
-    data['day'] = data['datetime'].dt.day / 31.0
-    data['dayofweek'] = data['datetime'].dt.dayofweek / 7.0
-    data['month'] = data['datetime'].dt.month / 12.0
-    return data
+# bỏ cột không dùng
+df = df.drop(columns=['id', 'counter_option'])
 
-df = create_time_features(df)
+# chuẩn hóa thời gian
+df['trigger_time'] = pd.to_datetime(df['trigger_time'], unit='s')
+df = df.sort_values('trigger_time')
 
-# Chuẩn bị dữ liệu cho LSTM
-def prepare_sequences(data, node_id, counter_id, seq_length=24, test_split=0.8):
-    """
-    Chuẩn bị sequences cho LSTM
-    seq_length: số bước thời gian sử dụng để dự đoán bước tiếp theo
-    """
-    # Lọc dữ liệu theo node_id và counter_id
-    subset = data[(data['node_id'] == node_id) & 
-                  (data['counter_id'] == counter_id)].copy()
-    subset = subset.sort_values('trigger_time')
-    
-    if len(subset) < seq_length + 1:
-        return None, None, None, None, None
-    
-    # Features: counter_value và time features
-    features = subset[['counter_value', 'hour', 'day', 'dayofweek', 'month']].values
-    
-    # Chuẩn hóa dữ liệu
-    scaler = MinMaxScaler()
-    features_scaled = scaler.fit_transform(features)
-    
-    # Tạo sequences
-    X, y = [], []
-    for i in range(len(features_scaled) - seq_length):
-        X.append(features_scaled[i:i+seq_length])
-        y.append(features_scaled[i+seq_length, 0])  # Chỉ dự đoán counter_value
-    
+# === pivot TẤT CẢ counter làm feature ===
+# index = time, columns = (node_id, counter_id), value = counter_value
+df_pivot = df.pivot_table(
+    index='trigger_time',
+    columns=['node_id', 'counter_id'],
+    values='counter_value'
+)
+
+df_pivot = df_pivot.sort_index(axis=1)   # sắp xếp cột theo (node_id, counter_id)
+
+print("df_pivot shape:", df_pivot.shape)     # (n_time, n_nodes * n_all_counters)
+print("Một vài cột:", df_pivot.columns[:10])
+df_pivot.head()
+
+scaler = MinMaxScaler(feature_range=(0, 1))
+data_scaled = scaler.fit_transform(df_pivot.values)
+
+n_time, n_features_all = data_scaled.shape
+node_ids = df_pivot.columns.get_level_values(0).unique()
+all_counters = df_pivot.columns.get_level_values(1).unique()
+
+n_nodes = len(node_ids)
+n_all_counters = len(all_counters)
+
+print("n_time:", n_time)
+print("n_features_all:", n_features_all)
+print("n_nodes:", n_nodes, "n_all_counters:", n_all_counters)
+print("node_ids: ", node_ids)
+
+# Lấy MultiIndex columns
+cols = df_pivot.columns  # MultiIndex (node_id, counter_id)
+
+# Tìm index các cột có counter_id thuộc target_counters
+target_col_indices = [
+    i for i, (nid, cid) in enumerate(zip(cols.get_level_values(0), cols.get_level_values(1)))
+    if cid in target_counters
+]
+print(target_col_indices)
+
+print("Số cột target:", len(target_col_indices))
+# n_target_features = n_nodes * n_target_counters
+n_target_counters = len(target_counters)
+assert len(target_col_indices) == n_nodes * n_target_counters
+
+def create_xy_all_features_target_subset(
+    data_scaled,
+    n_past,
+    target_col_indices,
+    n_nodes,
+    n_target_counters
+):
+    X, Y = [], []
+    n_time, n_features_all = data_scaled.shape
+
+    for i in range(n_past, n_time):
+        # input: n_past bước trước
+        X.append(data_scaled[i - n_past:i, :])  # (n_past, n_features_all)
+
+        # output: time step hiện tại, chỉ lấy các cột target
+        y_vec = data_scaled[i, target_col_indices]  # (n_nodes * n_target_counters,)
+        Y.append(y_vec)
+
     X = np.array(X)
-    y = np.array(y)
-    
-    # Chia train/test
-    split_idx = int(len(X) * test_split)
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
-    
-    return X_train, X_test, y_train, y_test, scaler
+    Y = np.array(Y)
 
-# Xây dựng mô hình LSTM
-def build_lstm_model(seq_length, n_features):
-    """Xây dựng mô hình LSTM"""
-    model = keras.Sequential([
-        layers.LSTM(128, activation='relu', return_sequences=True, 
-                   input_shape=(seq_length, n_features)),
-        layers.Dropout(0.2),
-        layers.LSTM(64, activation='relu', return_sequences=True),
-        layers.Dropout(0.2),
-        layers.LSTM(32, activation='relu'),
-        layers.Dropout(0.2),
-        layers.Dense(16, activation='relu'),
-        layers.Dense(1)
-    ])
-    
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.001),
-        loss='mse',
-        metrics=['mae']
-    )
-    
-    return model
+    # reshape Y về (N, n_nodes, n_target_counters)
+    Y = Y.reshape(-1, n_nodes, n_target_counters)
 
-# Đánh giá mô hình
-def evaluate_predictions(y_true, y_pred, scaler):
-    """Đánh giá hiệu suất mô hình"""
-    # Inverse transform để có giá trị thực
-    y_true_inv = scaler.inverse_transform(
-        np.concatenate([y_true.reshape(-1, 1), 
-                       np.zeros((len(y_true), 4))], axis=1)
-    )[:, 0]
-    
-    y_pred_inv = scaler.inverse_transform(
-        np.concatenate([y_pred.reshape(-1, 1), 
-                       np.zeros((len(y_pred), 4))], axis=1)
-    )[:, 0]
-    
-    mae = mean_absolute_error(y_true_inv, y_pred_inv)
-    rmse = np.sqrt(mean_squared_error(y_true_inv, y_pred_inv))
-    r2 = r2_score(y_true_inv, y_pred_inv)
-    mape = np.mean(np.abs((y_true_inv - y_pred_inv) / (y_true_inv + 1e-8))) * 100
-    
-    return mae, rmse, r2, mape, y_true_inv, y_pred_inv
+    return X, Y
 
-# Hàm train và evaluate cho một cặp node_id, counter_id
-def train_and_evaluate(data, node_id, counter_id, seq_length=24, epochs=50, batch_size=32):
-    """Train và đánh giá mô hình cho một cặp node_id, counter_id"""
+X, Y = create_xy_all_features_target_subset(
+    data_scaled,
+    n_past,
+    target_col_indices,
+    n_nodes,
+    n_target_counters
+)
+
+print("X:", X.shape)  # (N, n_past, n_features_all)
+print("Y:", Y.shape)  # (N, n_nodes, n_target_counters)
+
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.2, shuffle=False
+)
+
+print("X_train:", X_train.shape, "X_test:", X_test.shape)
+print("Y_train:", Y_train.shape, "Y_test:", Y_test.shape)
+
+n_past = X_train.shape[1]
+n_features_all = X_train.shape[2]
+
+inputs = Input(shape=(n_past, n_features_all))
+
+x = LSTM(128, return_sequences=True)(inputs)
+x = Dropout(0.2)(x)
+x = LSTM(64, return_sequences=False)(x)
+x = Dropout(0.2)(x)
+
+# Dense ra vector cho tất cả node * số counter cần dự đoán
+x = Dense(n_nodes * n_target_counters)(x)
+
+# Reshape thành (n_nodes, n_target_counters)
+outputs = Reshape((n_nodes, n_target_counters))(x)
+
+model = Model(inputs, outputs)
+model.compile(optimizer='adam', loss='mse')
+model.summary()
+
+history = model.fit(
+    X_train, Y_train,
+    epochs=20,
+    batch_size=32,
+    validation_split=0.1,
+    verbose=1
+)
+
+# 1. Dự đoán (đang ở scale)
+Y_pred_scaled = model.predict(X_test)  # (N_test, n_nodes, n_target_counters)
+
+# Flatten (N_test, n_nodes * n_target_counters)
+N_test = Y_test.shape[0]
+Y_test_scaled_flat = Y_test.reshape(N_test, n_nodes * n_target_counters)
+Y_pred_scaled_flat = Y_pred_scaled.reshape(N_test, n_nodes * n_target_counters)
+
+# 2. Tạo mảng tạm full feature
+temp_true = np.zeros((N_test, n_features_all))
+temp_pred = np.zeros((N_test, n_features_all))
+
+# 3. Gán các cột target vào đúng vị trí
+temp_true[:, target_col_indices] = Y_test_scaled_flat
+temp_pred[:, target_col_indices] = Y_pred_scaled_flat
+
+# 4. inverse_transform cho toàn bộ rồi lấy lại phần cần
+temp_true_inv = scaler.inverse_transform(temp_true)
+temp_pred_inv = scaler.inverse_transform(temp_pred)
+
+Y_test_inv_flat = temp_true_inv[:, target_col_indices]
+Y_pred_inv_flat = temp_pred_inv[:, target_col_indices]
+
+# 5. reshape lại (N_test, n_nodes, n_target_counters)
+Y_test_inv = Y_test_inv_flat.reshape(N_test, n_nodes, n_target_counters)
+Y_pred_inv = Y_pred_inv_flat.reshape(N_test, n_nodes, n_target_counters)
+
+# Hàm đánh giá chi tiết từng node × counter
+def evaluate_per_node_counter(Y_test, Y_pred_scaled, target_counters, node_ids):
+    """
+    Tính MAE, RMSE cho từng (node_id, counter_id).
+    """
+    N_test, n_nodes, n_counters = Y_test.shape
+
+    results = []
+
+    for i in range(n_nodes):
+        for j in range(n_counters):
+            actual = Y_test[:, i, j]
+            pred   = Y_pred_scaled[:, i, j]
+
+            mae  = mean_absolute_error(actual, pred)
+            rmse = np.sqrt(mean_squared_error(actual, pred))
+
+            results.append({
+                "node_id": node_ids[i],
+                "counter_id": target_counters[j],
+                "MAE": mae,
+                "RMSE": rmse
+            })
+
+    return results
+
     
-    print(f"\n{'='*70}")
-    print(f"TRAINING: Node {node_id}, Counter {counter_id}")
-    print(f"{'='*70}")
+results_node_counter = evaluate_per_node_counter(
+    Y_test, Y_pred_scaled, target_counters, node_ids
+)
+
+df_eval = pd.DataFrame(results_node_counter)
+df_eval
+
+# Hàm đánh giá theo từng counter
+def evaluate_per_counter(Y_test, Y_pred_scaled, target_counters):
+    """
+    MAE/RMSE cho từng counter_id (toàn bộ node).
+    """
+    N_test, n_nodes, n_counters = Y_test.shape
+
+    results = []
+
+    for j in range(n_counters):
+        actual = Y_test[:, :, j].reshape(-1)   # flatten toàn bộ node
+        pred   = Y_pred_scaled[:, :, j].reshape(-1)
+
+        mae  = mean_absolute_error(actual, pred)
+        rmse = np.sqrt(mean_squared_error(actual, pred))
+
+        results.append({
+            "counter_id": target_counters[j],
+            "MAE": mae,
+            "RMSE": rmse
+        })
+
+    return results
+
+df_counter = pd.DataFrame(evaluate_per_counter(Y_test, Y_pred_scaled, target_counters))
+df_counter
+
+# Hàm đánh giá toàn mô hình
+def evaluate_overall(Y_test, Y_pred_scaled):
+    """
+    MAE / RMSE toàn mô hình (mọi node + mọi counter).
+    """
+    actual = Y_test.reshape(-1)
+    pred   = Y_pred_scaled.reshape(-1)
+
+    mae  = mean_absolute_error(actual, pred)
+    rmse = np.sqrt(mean_squared_error(actual, pred))
+
+    return {"MAE": mae, "RMSE": rmse}
+
+overall = evaluate_overall(Y_test, Y_pred_scaled)
+overall
+
+def plot_single_node_counter(
+    time_index_test,
+    Y_test_inv, 
+    Y_pred_inv,
+    node_idx,            # index node (0..n_nodes-1)
+    counter_idx,         # index counter trong target_counters (0..n_target_counters-1)
+    target_counters,
+    node_ids,
+    title_prefix="Prediction vs Actual"
+):
+    """
+    Vẽ biểu đồ đường cho 1 node và 1 counter.
+    """
+    actual = Y_test_inv[:, node_idx, counter_idx]
+    pred   = Y_pred_inv[:, node_idx, counter_idx]
+
+    counter_id = target_counters[counter_idx]
+    node_id    = node_ids[node_idx]
+
+    plt.figure(figsize=(14,5))
+    plt.plot(time_index_test, actual, label="Actual", linewidth=2)
+    plt.plot(time_index_test, pred, label="Predicted", linestyle="--")
     
-    # Chuẩn bị dữ liệu
-    X_train, X_test, y_train, y_test, scaler = prepare_sequences(
-        data, node_id, counter_id, seq_length
-    )
-    
-    if X_train is None:
-        print(f"Không đủ dữ liệu cho Node {node_id}, Counter {counter_id}")
-        return None
-    
-    print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
-    print(f"Sequence length: {seq_length}, Features: {X_train.shape[2]}")
-    
-    # Xây dựng mô hình
-    model = build_lstm_model(seq_length, X_train.shape[2])
-    
-    # Callbacks
-    early_stopping = keras.callbacks.EarlyStopping(
-        monitor='val_loss',
-        patience=10,
-        restore_best_weights=True
-    )
-    
-    reduce_lr = keras.callbacks.ReduceLROnPlateau(
-        monitor='val_loss',
-        factor=0.5,
-        patience=5,
-        min_lr=1e-6
-    )
-    
-    # Training
-    print("\nBắt đầu training...")
-    history = model.fit(
-        X_train, y_train,
-        validation_split=0.2,
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=[early_stopping, reduce_lr],
-        verbose=0
-    )
-    
-    # Dự đoán
-    y_pred_train = model.predict(X_train, verbose=0).flatten()
-    y_pred_test = model.predict(X_test, verbose=0).flatten()
-    
-    # Đánh giá
-    print("\n" + "-"*70)
-    print("KẾT QUẢ TRAIN SET:")
-    mae_train, rmse_train, r2_train, mape_train, _, _ = evaluate_predictions(
-        y_train, y_pred_train, scaler
-    )
-    print(f"  MAE:  {mae_train:.2f}")
-    print(f"  RMSE: {rmse_train:.2f}")
-    print(f"  R²:   {r2_train:.4f}")
-    print(f"  MAPE: {mape_train:.2f}%")
-    
-    print("\n" + "-"*70)
-    print("KẾT QUẢ TEST SET:")
-    mae_test, rmse_test, r2_test, mape_test, y_true_inv, y_pred_inv = evaluate_predictions(
-        y_test, y_pred_test, scaler
-    )
-    print(f"  MAE:  {mae_test:.2f}")
-    print(f"  RMSE: {rmse_test:.2f}")
-    print(f"  R²:   {r2_test:.4f}")
-    print(f"  MAPE: {mape_test:.2f}%")
-    
-    # Vẽ biểu đồ training history
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-    
-    axes[0].plot(history.history['loss'], label='Train Loss')
-    axes[0].plot(history.history['val_loss'], label='Val Loss')
-    axes[0].set_title(f'Model Loss - Node {node_id}, Counter {counter_id}')
-    axes[0].set_xlabel('Epoch')
-    axes[0].set_ylabel('Loss')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-    
-    axes[1].plot(history.history['mae'], label='Train MAE')
-    axes[1].plot(history.history['val_mae'], label='Val MAE')
-    axes[1].set_title(f'Model MAE - Node {node_id}, Counter {counter_id}')
-    axes[1].set_xlabel('Epoch')
-    axes[1].set_ylabel('MAE')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Vẽ biểu đồ dự đoán
-    n_plot = min(200, len(y_true_inv))
-    plt.figure(figsize=(14, 5))
-    plt.plot(y_true_inv[:n_plot], label='Giá trị thực', marker='o', markersize=3, linewidth=1.5)
-    plt.plot(y_pred_inv[:n_plot], label='Giá trị dự đoán', marker='x', markersize=3, linewidth=1.5)
-    plt.title(f'Dự đoán Counter Value - Node {node_id}, Counter {counter_id}')
-    plt.xlabel('Thời điểm')
-    plt.ylabel('Counter Value')
+    plt.title(f"{title_prefix} | Node {node_id} | Counter {counter_id}")
+    plt.xlabel("Time")
+    plt.ylabel("Counter Value")
+    plt.grid(True)
     plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
     plt.show()
-    
-    return {
-        'model': model,
-        'scaler': scaler,
-        'history': history,
-        'metrics': {
-            'mae_train': mae_train,
-            'rmse_train': rmse_train,
-            'r2_train': r2_train,
-            'mape_train': mape_train,
-            'mae_test': mae_test,
-            'rmse_test': rmse_test,
-            'r2_test': r2_test,
-            'mape_test': mape_test
-        }
-    }
 
-# Train mô hình cho một số node_id và counter_id mẫu
-print("\n" + "="*70)
-print("BẮT ĐẦU TRAINING MÔ HÌNH LSTM")
-print("="*70)
+time_index = df_pivot.index[n_past:]       # thời gian tương ứng với X,Y
+time_index_train = time_index[:len(X_train)]
+time_index_test  = time_index[len(X_train):]
 
-# Lấy 2 node và 2 counter đầu tiên để demo
-sample_nodes = df['node_id'].unique()[:2]
-sample_counters = df['counter_id'].unique()[:2]
+plot_single_node_counter(
+    time_index_test,
+    Y_test_inv,
+    Y_pred_inv,
+    node_idx=0,
+    counter_idx=0,
+    target_counters=target_counters,
+    node_ids=node_ids
+)
 
-# Dictionary lưu trữ các mô hình đã train
-trained_models = {}
-
-seq_length = 24  # Sử dụng 24 bước thời gian trước đó để dự đoán
-epochs = 50
-batch_size = 32
-
-for node in sample_nodes:
-    for counter in sample_counters:
-        key = f"node_{node}_counter_{counter}"
-        result = train_and_evaluate(
-            df, node, counter, 
-            seq_length=seq_length, 
-            epochs=epochs, 
-            batch_size=batch_size
-        )
-        if result is not None:
-            trained_models[key] = result
-
-# Hàm dự đoán cho dữ liệu mới
-def predict_future(model, scaler, last_sequence, n_steps=10):
+def plot_single_node_counter_timerange(
+    time_index_test,
+    Y_test_inv,
+    Y_pred_inv,
+    node_idx,
+    counter_idx,
+    target_counters,
+    node_ids,
+    start_time,
+    end_time,
+    title_prefix="Prediction vs Actual"
+):
     """
-    Dự đoán n_steps bước tiếp theo
+    Vẽ biểu đồ đường cho 1 node và 1 counter trong khoảng thời gian chỉ định.
     
-    Parameters:
-    - model: Mô hình LSTM đã train
-    - scaler: MinMaxScaler đã fit
-    - last_sequence: Sequence cuối cùng (đã scaled) shape (seq_length, n_features)
-    - n_steps: Số bước cần dự đoán
-    
-    Returns:
-    - predictions: Mảng giá trị dự đoán (đã inverse transform)
+    start_time, end_time: dạng string '2025-01-01 00:00:00' hoặc datetime
     """
-    predictions = []
-    current_seq = last_sequence.copy()
+
+    # Convert thời gian nếu cần
+    if isinstance(start_time, str):
+        start_time = pd.to_datetime(start_time)
+    if isinstance(end_time, str):
+        end_time = pd.to_datetime(end_time)
+
+    # --- Tìm index trong đoạn thời gian X -> Y ---
+    mask = (time_index_test >= start_time) & (time_index_test <= end_time)
+
+    if mask.sum() == 0:
+        print("❌ Không có dữ liệu trong khoảng thời gian yêu cầu!")
+        return
+
+    t = time_index_test[mask]
+    actual = Y_test_inv[mask, node_idx, counter_idx]
+    pred   = Y_pred_inv[mask, node_idx, counter_idx]
+
+    counter_id = target_counters[counter_idx]
+    node_id = node_ids[node_idx]
+
+    # --- Vẽ ---
+    plt.figure(figsize=(14, 5))
+    plt.plot(t, actual, label="Actual", linewidth=2)
+    plt.plot(t, pred, label="Prediction", linestyle="--")
+
+    plt.title(f"{title_prefix} | Node {node_id} | Counter {counter_id}\n{start_time} → {end_time}")
+    plt.xlabel("Time")
+    plt.ylabel("Counter Value")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+
+plot_single_node_counter_timerange(
+    time_index_test,
+    Y_test_inv,
+    Y_pred_inv,
+    node_idx=0,
+    counter_idx=2,
+    target_counters=target_counters,
+    node_ids=node_ids,
+    start_time="2025-11-20 00:00:00",
+    end_time="2025-11-21 00:00:00"
+)
+
+def plot_all_nodes_timerange(
+    time_index_test,
+    Y_test_inv,
+    Y_pred_inv,
+    counter_idx,
+    target_counters,
+    node_ids,
+    start_time,
+    end_time
+):
+    if isinstance(start_time, str):
+        start_time = pd.to_datetime(start_time)
+    if isinstance(end_time, str):
+        end_time = pd.to_datetime(end_time)
+
+    mask = (time_index_test >= start_time) & (time_index_test <= end_time)
+
+    if mask.sum() == 0:
+        print("❌ Không có dữ liệu trong khoảng thời gian yêu cầu!")
+        return
+
+    t = time_index_test[mask]
+    n_nodes = Y_test_inv.shape[1]
+
+    plt.figure(figsize=(14, 6))
+
+    for i in range(n_nodes):
+        plt.plot(t, Y_test_inv[mask, i, counter_idx], label=f"Actual N{i}")
+        plt.plot(t, Y_pred_inv[mask, i, counter_idx], linestyle="--", label=f"Pred N{i}")
+
+    counter_id = target_counters[counter_idx]
+
+    plt.title(f"Actual vs Pred for counter {counter_id}\n{start_time} → {end_time}")
+    plt.xlabel("Time")
+    plt.ylabel("Counter Value")
+    plt.grid(True)
+    plt.legend(ncol=2)
+    plt.show()
+
+plot_all_nodes_timerange(
+    time_index_test,
+    Y_test_inv,
+    Y_pred_inv,
+    counter_idx=1,
+    target_counters=target_counters,
+    node_ids=node_ids,
+    start_time="2025-11-20 00:00:00",
+    end_time="2025-11-23 00:00:00"
+)
+
+def evaluate_weekday_vs_weekend(Y_test, Y_pred, time_index_test):
+    """
+    Đánh giá MAE, RMSE giữa ngày trong tuần (Mon-Fri) và cuối tuần (Sat-Sun).
     
-    for _ in range(n_steps):
-        # Dự đoán bước tiếp theo
-        pred = model.predict(current_seq.reshape(1, current_seq.shape[0], current_seq.shape[1]), 
-                            verbose=0)[0, 0]
-        predictions.append(pred)
+    Y_test_inv, Y_pred_inv: (N_test, n_nodes, n_target_counters)
+    time_index_test: DatetimeIndex hoặc Series có length = N_test
+    """
+    # Đảm bảo time_index_test là DatetimeIndex
+    time_index_test = pd.to_datetime(time_index_test)
+    
+    # Tạo mask
+    weekday_mask = time_index_test.weekday < 5    # 0..4: Mon-Fri
+    weekend_mask = time_index_test.weekday >= 5   # 5..6: Sat-Sun
+    
+    results = {}
+    
+    def _calc_metrics(mask, name):
+        if mask.sum() == 0:
+            return {f"{name}_MAE": np.nan, f"{name}_RMSE": np.nan}
         
-        # Cập nhật sequence (giữ nguyên time features, chỉ update counter_value)
-        new_row = current_seq[-1].copy()
-        new_row[0] = pred  # Update counter_value
+        actual = Y_test[mask].reshape(-1)
+        pred   = Y_pred[mask].reshape(-1)
         
-        # Shift sequence
-        current_seq = np.vstack([current_seq[1:], new_row])
+        mae  = mean_absolute_error(actual, pred)
+        rmse = np.sqrt(mean_squared_error(actual, pred))
+        return {f"{name}_MAE": mae, f"{name}_RMSE": rmse}
     
-    # Inverse transform
-    predictions = np.array(predictions)
-    predictions_inv = scaler.inverse_transform(
-        np.concatenate([predictions.reshape(-1, 1), 
-                       np.zeros((len(predictions), 4))], axis=1)
-    )[:, 0]
+    results.update(_calc_metrics(weekday_mask, "weekday"))
+    results.update(_calc_metrics(weekend_mask, "weekend"))
     
-    return predictions_inv
+    return results
 
-print("\n" + "="*70)
-print("HOÀN THÀNH TRAINING")
-print("="*70)
-print(f"\nĐã train {len(trained_models)} mô hình")
-print("\nCác mô hình đã train:", list(trained_models.keys()))
+weekday_weekend_metrics = evaluate_weekday_vs_weekend(
+    Y_test, Y_pred_scaled, time_index_test
+)
+print(weekday_weekend_metrics)
 
-print("\n" + "="*70)
-print("HƯỚNG DẪN SỬ DỤNG")
-print("="*70)
-print("""
-1. Train mô hình cho các node và counter khác:
-   result = train_and_evaluate(df, node_id, counter_id, seq_length=24, epochs=50)
+# Hàm đánh giá theo từng giờ trong ngày
+def evaluate_by_hour_of_day(Y_test, Y_pred, time_index_test):
+    """
+    Đánh giá MAE, RMSE cho từng giờ trong ngày (0-23).
+    
+    Returns: list[dict] để dễ chuyển thành DataFrame.
+    """
+    time_index_test = pd.to_datetime(time_index_test)
+    hours = time_index_test.hour.values  # array (N_test,)
+    
+    results = []
+    
+    for h in range(24):
+        mask = (hours == h)
+        if mask.sum() == 0:
+            # Không có mẫu nào ở giờ này
+            results.append({
+                "hour": h,
+                "MAE": np.nan,
+                "RMSE": np.nan,
+                "n_samples": 0
+            })
+            continue
+        
+        actual = Y_test[mask].reshape(-1)
+        pred   = Y_pred[mask].reshape(-1)
+        
+        mae  = mean_absolute_error(actual, pred)
+        rmse = np.sqrt(mean_squared_error(actual, pred))
+        
+        results.append({
+            "hour": h,
+            "MAE": mae,
+            "RMSE": rmse,
+            "n_samples": mask.sum()
+        })
+    
+    return results
 
-2. Dự đoán tương lai:
-   # Lấy sequence cuối cùng từ dữ liệu
-   last_seq = X_test[-1]  # hoặc từ dữ liệu mới
-   predictions = predict_future(model, scaler, last_seq, n_steps=10)
+hour_metrics = evaluate_by_hour_of_day(Y_test, Y_pred_scaled, time_index_test)
 
-3. Lưu mô hình:
-   model.save('lstm_model_node1_counter1.h5')
-   
-4. Load mô hình:
-   loaded_model = keras.models.load_model('lstm_model_node1_counter1.h5')
-""")
+import pandas as pd
+df_hour_metrics = pd.DataFrame(hour_metrics)
+print(df_hour_metrics)
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(12,5))
+plt.plot(df_hour_metrics["hour"], df_hour_metrics["MAE"], marker="o", label="MAE")
+plt.plot(df_hour_metrics["hour"], df_hour_metrics["RMSE"], marker="s", label="RMSE")
+plt.xlabel("Hour of day")
+plt.ylabel("Error")
+plt.title("MAE / RMSE theo từng giờ trong ngày")
+plt.grid(True)
+plt.legend()
+plt.xticks(range(0, 24))
+plt.show()
